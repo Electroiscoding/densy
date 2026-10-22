@@ -106,3 +106,42 @@ with torch.inference_mode():
 
 print(tokenizer.decode(output_ids[0].tolist(), skip_special_tokens=False))
 ```
+
+---
+
+## Supervised Fine-Tuning (SFT)
+
+```bash
+torchrun --nproc_per_node=8 run_sft.py \
+  --base_model ./checkpoints/densy_500m/final \
+  --data_dir /path/to/sft_data \
+  --output_dir ./checkpoints/densy_sft \
+  --total_tokens 20000000 \
+  --seq_len 4096 \
+  --global_batch_tokens 131072 \
+  --micro_batch_per_gpu 2 \
+  --lr_max 2e-5 \
+  --lr_min 2e-6 \
+  --bf16 \
+  --save_every_steps 50
+```
+
+---
+
+## Direct Preference Optimization (DPO)
+
+```bash
+torchrun --nproc_per_node=8 run_dpo.py \
+  --base_model ./checkpoints/densy_sft/final \
+  --data_dir /path/to/dpo_data \
+  --output_dir ./checkpoints/densy_dpo \
+  --beta 0.1 \
+  --batch_pairs 1 \
+  --ga_steps 4 \
+  --seq_len 2048 \
+  --max_steps 40 \
+  --max_pairs 1000 \
+  --lr 5e-7 \
+  --bf16 \
+  --save_every_steps 20
+```
