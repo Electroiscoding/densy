@@ -140,10 +140,13 @@ class DensyModel(nn.Module):
         return input_ids
 
 
-def build_densy_500m(cfg: Optional[DensyConfig] = None) -> DensyModel:
+def build_densy_330m(cfg: Optional[DensyConfig] = None) -> DensyModel:
     if cfg is None:
         cfg = DensyConfig()
     model = DensyModel(cfg)
     n = sum(p.numel() for p in model.parameters())
     print(f"DensyModel: {n/1e9:.3f}B total params | d={cfg.d_model}, L={cfg.n_layers}, H={cfg.n_heads} | weight_tied={cfg.weight_tie}")
     return model
+
+build_densy = build_densy_330m
+build_densy_500m = build_densy_330m

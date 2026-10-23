@@ -6,8 +6,8 @@ from pathlib import Path
 @dataclass
 class DensyConfig:
     vocab_size: int = 206464
-    d_model: int = 1024
-    n_heads: int = 16
+    d_model: int = 768
+    n_heads: int = 12
     n_layers: int = 24
     mlp_ratio: int = 4
     seq_len: int = 4096
