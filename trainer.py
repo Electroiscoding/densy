@@ -120,8 +120,8 @@ class Trainer:
             model = model.to(torch.bfloat16)
 
         if use_compile:
-            logger.info("Compiling model with torch.compile max-autotune...")
-            model = torch.compile(model, mode="max-autotune")
+            logger.info("Compiling model with torch.compile...")
+            model = torch.compile(model)
 
         if world_size > 1:
             model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)

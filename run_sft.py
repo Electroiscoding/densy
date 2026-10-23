@@ -122,7 +122,7 @@ def main():
     if args.bf16:
         model = model.to(torch.bfloat16)
     if not args.no_compile:
-        model = torch.compile(model, mode="max-autotune")
+        model = torch.compile(model)
     if world_size > 1:
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 

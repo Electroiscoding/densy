@@ -160,8 +160,8 @@ def main():
         policy = policy.to(torch.bfloat16)
         ref = ref.to(torch.bfloat16)
     if not args.no_compile:
-        policy = torch.compile(policy, mode="max-autotune")
-        ref = torch.compile(ref, mode="max-autotune")
+        policy = torch.compile(policy)
+        ref = torch.compile(ref)
     if world_size > 1:
         policy = DDP(policy, device_ids=[local_rank], find_unused_parameters=False)
 
