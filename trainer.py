@@ -212,14 +212,15 @@ class Trainer:
                 self.global_step += 1
                 self.tokens_seen += step_tokens
 
-                if self.is_main and self.global_step % 10 == 0:
-                    elapsed = time.perf_counter() - step_start
-                    tok_per_sec = step_tokens * 10 / elapsed
+                if self.is_main and (self.global_step <= 5 or self.global_step % 10 == 0):
+                    elapsed = max(1e-5, time.perf_counter() - step_start)
+                    n_steps_logged = 1 if self.global_step <= 5 else 10
+                    tok_per_sec = step_tokens * n_steps_logged / elapsed
                     cost = (time.time() - self._start_time) / 3600 * self.hourly_cost
                     eta_h = (self.total_tokens - self.tokens_seen) / max(tok_per_sec, 1) / 3600
                     logger.info(
                         f"Step {self.global_step}/{total_steps} | "
-                        f"Loss {accum_loss*self.ga_steps:.4f} | "
+                        f"Loss {accum_loss:.4f} | "
                         f"LR {lr:.2e} | GradNorm {grad_norm:.3f} | "
                         f"tok/s {tok_per_sec:,.0f} | "
                         f"Seen {self.tokens_seen/1e9:.2f}B/{self.total_tokens/1e9:.0f}B | "
