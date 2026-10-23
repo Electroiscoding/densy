@@ -16,8 +16,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 
 from config import DensyConfig
-from model import build_densy_500m
+from model import build_densy_330m
 from trainer import build_optimizer, CosineScheduler
+from hub_uploader import upload_folder_async
 
 logging.basicConfig(
     level=logging.INFO,
@@ -73,8 +74,8 @@ def parse_args():
     p.add_argument("--output_dir",          default="./checkpoints/densy_sft")
     p.add_argument("--total_tokens",        type=int,   default=20_000_000)
     p.add_argument("--seq_len",             type=int,   default=4096)
-    p.add_argument("--global_batch_tokens", type=int,   default=131072)
-    p.add_argument("--micro_batch_per_gpu", type=int,   default=2)
+    p.add_argument("--global_batch_tokens", type=int,   default=262144)
+    p.add_argument("--micro_batch_per_gpu", type=int,   default=4)
     p.add_argument("--lr_max",              type=float, default=2e-5)
     p.add_argument("--lr_min",              type=float, default=2e-6)
     p.add_argument("--warmup_ratio",        type=float, default=0.03)
@@ -82,7 +83,7 @@ def parse_args():
     p.add_argument("--weight_decay",        type=float, default=0.01)
     p.add_argument("--bf16",                action="store_true", default=True)
     p.add_argument("--no_compile",          action="store_true")
-    p.add_argument("--save_every_steps",    type=int,   default=50)
+    p.add_argument("--save_every_steps",    type=int,   default=25)
     p.add_argument("--num_workers",         type=int,   default=4)
     return p.parse_args()
 
@@ -105,7 +106,7 @@ def main():
 
     cfg = DensyConfig.from_json(str(base_dir / "model_config.json")) if (base_dir / "model_config.json").exists() else DensyConfig()
     cfg.seq_len = args.seq_len
-    model = build_densy_500m(cfg)
+    model = build_densy_330m(cfg)
 
     for fn in ("pytorch_model.bin", "model_bf16.pt", "model.pt", "checkpoint.pt"):
         wp = base_dir / fn
@@ -113,6 +114,7 @@ def main():
             sd = torch.load(str(wp), map_location="cpu")
             if "model" in sd:
                 sd = sd["model"]
+            sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
             model.load_state_dict({k: v.to(torch.bfloat16) for k, v in sd.items()}, strict=False)
             if is_main:
                 logger.info(f"Loaded weights from {wp}")
@@ -129,23 +131,17 @@ def main():
     raw_model = model.module if hasattr(model, "module") else model
     dataset = PackedSFTDataset(args.data_dir, seq_len=args.seq_len)
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
-    loader = DataLoader(
-        dataset,
-        batch_size=args.micro_batch_per_gpu,
-        sampler=sampler,
-        shuffle=(sampler is None),
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True,
-    )
+    loader = DataLoader(dataset, batch_size=args.micro_batch_per_gpu, sampler=sampler, shuffle=(sampler is None),
+                        num_workers=args.num_workers, pin_memory=True, drop_last=True)
 
-    ga_steps = max(1, args.global_batch_tokens // (args.micro_batch_per_gpu * args.seq_len * world_size))
-    step_tokens = ga_steps * args.micro_batch_per_gpu * args.seq_len * world_size
-    total_steps = args.total_tokens // step_tokens
+    tokens_per_micro = args.micro_batch_per_gpu * args.seq_len * world_size
+    ga_steps = max(1, args.global_batch_tokens // tokens_per_micro)
+    step_tokens = tokens_per_micro * ga_steps
+    total_steps = max(1, args.total_tokens // args.global_batch_tokens)
 
-    optimizer = build_optimizer(raw_model, args.lr_max, args.weight_decay)
-    warmup_tokens = int(args.total_tokens * args.warmup_ratio)
-    scheduler = CosineScheduler(optimizer, args.lr_max, args.lr_min, warmup_tokens, args.total_tokens)
+    optimizer = build_optimizer(raw_model, lr_max=args.lr_max, weight_decay=args.weight_decay)
+    scheduler = CosineScheduler(optimizer, lr_max=args.lr_max, lr_min=args.lr_min,
+                                total_tokens=args.total_tokens, warmup_ratio=args.warmup_ratio)
 
     if is_main:
         logger.info(f"Densy SFT | {world_size} GPUs | ga_steps={ga_steps} | total_steps={total_steps}")
@@ -184,20 +180,21 @@ def main():
             global_step += 1
             tokens_seen += step_tokens
 
-            if is_main and global_step % 10 == 0:
+            if is_main and (global_step <= 5 or global_step % 10 == 0):
                 elapsed = time.perf_counter() - start_t
-                tok_s = step_tokens * 10 / max(elapsed, 1e-5)
+                tok_s = step_tokens * (1 if global_step <= 5 else 10) / max(elapsed, 1e-5)
                 logger.info(f"SFT Step {global_step}/{total_steps} | Loss {accum_loss*ga_steps:.4f} | LR {lr:.2e} | Norm {grad_norm:.3f} | tok/s {tok_s:,.0f}")
                 start_t = time.perf_counter()
 
             if global_step % args.save_every_steps == 0 and is_main:
-                ckpt_dir = output_dir / f"sft_step{global_step}"
+                ckpt_dir = output_dir / f"step_{global_step}"
                 ckpt_dir.mkdir(parents=True, exist_ok=True)
                 raw = raw_model
                 bf16_sd = {k: v.to(torch.bfloat16) for k, v in raw.state_dict().items()}
                 torch.save(bf16_sd, ckpt_dir / "pytorch_model.bin")
                 raw.cfg.to_json(str(ckpt_dir / "model_config.json"))
                 logger.info(f"Saved SFT checkpoint: {ckpt_dir}")
+                upload_folder_async(str(ckpt_dir), repo_id="Phase-Technologies/densy-330m-sft", path_in_repo=ckpt_dir.name)
 
             accum_loss = 0.0
             micro_step = 0
@@ -211,6 +208,7 @@ def main():
         torch.save(bf16_sd, final_dir / "model_bf16.pt")
         raw.cfg.to_json(str(final_dir / "model_config.json"))
         logger.info(f"SFT complete. Model exported to {final_dir}")
+        upload_folder_async(str(final_dir), repo_id="Phase-Technologies/densy-330m-sft", path_in_repo="final")
 
     if world_size > 1:
         dist.destroy_process_group()

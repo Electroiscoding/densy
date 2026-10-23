@@ -3,11 +3,10 @@ import os
 import sys
 import time
 import math
-import json
 import logging
 import argparse
 from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Optional, Dict, Tuple, List
 
 import numpy as np
 import torch
@@ -18,8 +17,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 
 from config import DensyConfig
-from model import build_densy_500m
-from trainer import build_optimizer
+from model import build_densy_330m
+from trainer import build_optimizer, CosineScheduler
+from hub_uploader import upload_folder_async
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,8 +30,8 @@ logging.basicConfig(
 logger = logging.getLogger("run_dpo")
 
 
-class PreTokenizedPreferenceDataset(Dataset):
-    def __init__(self, data_dir: str, seq_len: int, max_samples: Optional[int] = None):
+class DPODataset(Dataset):
+    def __init__(self, data_dir: str, seq_len: int, max_pairs: Optional[int] = None, seed: int = 42):
         self.seq_len = seq_len
         npz_files = sorted(Path(data_dir).glob("**/*.npz"))
         if not npz_files:
@@ -40,23 +40,25 @@ class PreTokenizedPreferenceDataset(Dataset):
         for f in npz_files:
             try:
                 data = np.load(str(f), allow_pickle=True)
-                cf, rf = data["chosen_full_ids"], data["rejected_full_ids"]
-                cm, rm = data["chosen_loss_mask"], data["rejected_loss_mask"]
+                cf = data["chosen_full_ids"] if "chosen_full_ids" in data else data.get("chosen_input_ids")
+                rf = data["rejected_full_ids"] if "rejected_full_ids" in data else data.get("rejected_input_ids")
+                cm = data["chosen_loss_mask"]
+                rm = data["rejected_loss_mask"]
                 for i in range(len(cf)):
                     self.samples.append((cf[i], rf[i], cm[i], rm[i]))
-                    if max_samples and len(self.samples) >= max_samples:
-                        break
-                if max_samples and len(self.samples) >= max_samples:
-                    break
             except Exception as e:
                 logger.warning(f"Error loading {f}: {e}")
-        logger.info(f"PreTokenizedPreferenceDataset: {len(self.samples):,} pairs loaded")
+        if max_pairs and max_pairs < len(self.samples):
+            rng = np.random.default_rng(seed)
+            idx = rng.choice(len(self.samples), max_pairs, replace=False)
+            self.samples = [self.samples[i] for i in idx]
+        logger.info(f"DPODataset: loaded {len(self.samples):,} preference pairs")
 
     def __len__(self) -> int:
         return len(self.samples)
 
-    def _pad_trunc(self, arr, pad_val=0):
-        t = torch.tensor(arr[:self.seq_len], dtype=torch.long)
+    def _pad_trunc(self, arr: np.ndarray, pad_val: int) -> torch.Tensor:
+        t = torch.from_numpy(arr[:self.seq_len]).long()
         if len(t) < self.seq_len:
             pad = torch.full((self.seq_len - len(t),), pad_val, dtype=torch.long)
             t = torch.cat([t, pad])
@@ -101,7 +103,7 @@ def parse_args():
     p.add_argument("--data_dir",         required=True)
     p.add_argument("--output_dir",       default="./checkpoints/densy_dpo")
     p.add_argument("--beta",             type=float, default=0.1)
-    p.add_argument("--batch_pairs",      type=int,   default=1)
+    p.add_argument("--batch_pairs",      type=int,   default=2)
     p.add_argument("--ga_steps",         type=int,   default=4)
     p.add_argument("--seq_len",          type=int,   default=2048)
     p.add_argument("--max_steps",        type=int,   default=40)
@@ -134,8 +136,8 @@ def main():
     cfg = DensyConfig.from_json(str(base_dir / "model_config.json")) if (base_dir / "model_config.json").exists() else DensyConfig()
     cfg.seq_len = args.seq_len
 
-    policy = build_densy_500m(cfg)
-    ref = build_densy_500m(cfg)
+    policy = build_densy_330m(cfg)
+    ref = build_densy_330m(cfg)
 
     for fn in ("pytorch_model.bin", "model_bf16.pt", "model.pt"):
         wp = base_dir / fn
@@ -143,18 +145,17 @@ def main():
             sd = torch.load(str(wp), map_location="cpu")
             if "model" in sd:
                 sd = sd["model"]
-            sd = {k: v.to(torch.bfloat16) for k, v in sd.items()}
-            policy.load_state_dict(sd, strict=False)
-            ref.load_state_dict(sd, strict=False)
+            sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
+            policy.load_state_dict({k: v.to(torch.bfloat16) for k, v in sd.items()}, strict=False)
+            ref.load_state_dict({k: v.to(torch.bfloat16) for k, v in sd.items()}, strict=False)
             if is_main:
-                logger.info(f"Loaded base weights from {wp}")
+                logger.info(f"Loaded base model weights from {wp}")
             break
 
     policy = policy.to(device)
-    ref = ref.to(device)
+    ref = ref.to(device).eval()
     for p in ref.parameters():
-        p.requires_grad = False
-    ref.eval()
+        p.requires_grad_(False)
 
     if args.bf16:
         policy = policy.to(torch.bfloat16)
@@ -166,89 +167,97 @@ def main():
         policy = DDP(policy, device_ids=[local_rank], find_unused_parameters=False)
 
     raw_policy = policy.module if hasattr(policy, "module") else policy
-    optimizer = build_optimizer(raw_policy, args.lr, weight_decay=0.0)
+    raw_ref = ref.module if hasattr(ref, "module") else ref
 
-    dataset = PreTokenizedPreferenceDataset(args.data_dir, seq_len=args.seq_len, max_samples=args.max_pairs)
+    dataset = DPODataset(args.data_dir, seq_len=args.seq_len, max_pairs=args.max_pairs)
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_pairs,
-        sampler=sampler,
-        shuffle=(sampler is None),
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True,
-    )
+    loader = DataLoader(dataset, batch_size=args.batch_pairs, sampler=sampler, shuffle=(sampler is None),
+                        num_workers=args.num_workers, pin_memory=True, drop_last=True)
+
+    optimizer = build_optimizer(raw_policy, lr_max=args.lr, weight_decay=0.01)
+    scheduler = CosineScheduler(optimizer, lr_max=args.lr, lr_min=args.lr * 0.1, warmup_tokens=int(args.max_steps * args.batch_pairs * world_size * 0.05), total_tokens=args.max_steps * args.batch_pairs * world_size)
 
     if is_main:
-        logger.info(f"Densy DPO | beta={args.beta} | {world_size} GPUs | max_steps={args.max_steps}")
+        logger.info(f"Densy DPO | {world_size} GPUs | beta={args.beta} | max_steps={args.max_steps}")
 
     policy.train()
     optimizer.zero_grad(set_to_none=True)
-    micro_step = 0
     global_step = 0
+    micro_step = 0
     accum_loss = 0.0
-    all_acc = []
+    accum_c_rew = 0.0
+    accum_r_rew = 0.0
+    start_t = time.perf_counter()
 
-    for batch in loader:
+    for epoch in range(100):
         if global_step >= args.max_steps:
             break
+        if sampler:
+            sampler.set_epoch(epoch)
+        for batch in loader:
+            if global_step >= args.max_steps:
+                break
+            ci = batch["chosen_input_ids"].to(device, non_blocking=True)
+            cl = batch["chosen_labels"].to(device, non_blocking=True)
+            ri = batch["rejected_input_ids"].to(device, non_blocking=True)
+            rl = batch["rejected_labels"].to(device, non_blocking=True)
 
-        ci = batch["chosen_input_ids"].to(device, non_blocking=True)
-        cl = batch["chosen_labels"].to(device, non_blocking=True)
-        ri = batch["rejected_input_ids"].to(device, non_blocking=True)
-        rl = batch["rejected_labels"].to(device, non_blocking=True)
+            is_last = (micro_step == args.ga_steps - 1)
+            ctx = policy.no_sync() if (world_size > 1 and not is_last) else torch.nullcontext() if hasattr(torch, "nullcontext") else __import__("contextlib").nullcontext()
 
-        combined_in = torch.cat([ci, ri], dim=0)
-        B = ci.shape[0]
-
-        is_last = (micro_step == args.ga_steps - 1)
-        ctx = policy.no_sync() if (world_size > 1 and not is_last) else torch.nullcontext() if hasattr(torch, "nullcontext") else __import__("contextlib").nullcontext()
-
-        with ctx:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=args.bf16):
-                p_out = policy(combined_in)
-                p_logits = p_out["logits"]
-                pi_c = get_log_probs(p_logits[:B], cl)
-                pi_r = get_log_probs(p_logits[B:], rl)
+                with torch.inference_mode():
+                    ref_c_out = raw_ref(ci)
+                    ref_r_out = raw_ref(ri)
+                    ref_c = get_log_probs(ref_c_out["logits"], cl)
+                    ref_r = get_log_probs(ref_r_out["logits"], rl)
 
-                with torch.no_grad():
-                    r_out = ref(combined_in)
-                    r_logits = r_out["logits"]
-                    ref_c = get_log_probs(r_logits[:B], cl)
-                    ref_r = get_log_probs(r_logits[B:], rl)
+                with ctx:
+                    pi_c_out = policy(ci)
+                    pi_r_out = policy(ri)
+                    pi_c = get_log_probs(pi_c_out["logits"], cl)
+                    pi_r = get_log_probs(pi_r_out["logits"], rl)
+                    loss, c_rew, r_rew = dpo_loss(pi_c, pi_r, ref_c, ref_r, beta=args.beta)
+                    scaled_loss = loss / args.ga_steps
 
-                loss, c_rew, r_rew = dpo_loss(pi_c, pi_r, ref_c, ref_r, beta=args.beta)
-                loss = loss / args.ga_steps
+                scaled_loss.backward()
 
-            loss.backward()
+            accum_loss += loss.item() / args.ga_steps
+            accum_c_rew += c_rew.mean().item() / args.ga_steps
+            accum_r_rew += r_rew.mean().item() / args.ga_steps
+            micro_step += 1
 
-        accum_loss += loss.item()
-        acc = (c_rew > r_rew).float().mean().item()
-        all_acc.append(acc)
-        micro_step += 1
+            if micro_step == args.ga_steps:
+                grad_norm = torch.nn.utils.clip_grad_norm_(raw_policy.parameters(), args.grad_clip)
+                optimizer.step()
+                scheduler.step(args.batch_pairs * world_size)
+                optimizer.zero_grad(set_to_none=True)
 
-        if micro_step == args.ga_steps:
-            grad_norm = torch.nn.utils.clip_grad_norm_(raw_policy.parameters(), args.grad_clip)
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+                global_step += 1
+                if is_main and (global_step <= 5 or global_step % 5 == 0):
+                    elapsed = time.perf_counter() - start_t
+                    logger.info(
+                        f"DPO Step {global_step}/{args.max_steps} | "
+                        f"Loss {accum_loss:.4f} | "
+                        f"Margin {(accum_c_rew - accum_r_rew):+.3f} | "
+                        f"Norm {grad_norm:.3f} | {elapsed:.1f}s"
+                    )
+                    start_t = time.perf_counter()
 
-            global_step += 1
-            if is_main and global_step % 5 == 0:
-                avg_acc = sum(all_acc[-20:]) / max(1, len(all_acc[-20:]))
-                logger.info(f"DPO Step {global_step}/{args.max_steps} | Loss {accum_loss*args.ga_steps:.4f} | Acc {avg_acc:.3f} | Norm {grad_norm:.3f}")
+                if global_step % args.save_every_steps == 0 and is_main:
+                    ckpt_dir = output_dir / f"step_{global_step}"
+                    ckpt_dir.mkdir(parents=True, exist_ok=True)
+                    raw = raw_policy
+                    bf16_sd = {k: v.to(torch.bfloat16) for k, v in raw.state_dict().items()}
+                    torch.save(bf16_sd, ckpt_dir / "pytorch_model.bin")
+                    raw.cfg.to_json(str(ckpt_dir / "model_config.json"))
+                    logger.info(f"Saved DPO checkpoint: {ckpt_dir}")
+                    upload_folder_async(str(ckpt_dir), repo_id="Phase-Technologies/Densy-330M-Chat", path_in_repo=ckpt_dir.name)
 
-            if global_step % args.save_every_steps == 0 and is_main:
-                ckpt_dir = output_dir / f"dpo_step{global_step}"
-                ckpt_dir.mkdir(parents=True, exist_ok=True)
-                raw = raw_policy
-                bf16_sd = {k: v.to(torch.bfloat16) for k, v in raw.state_dict().items()}
-                torch.save(bf16_sd, ckpt_dir / "pytorch_model.bin")
-                raw.cfg.to_json(str(ckpt_dir / "model_config.json"))
-                logger.info(f"Saved DPO checkpoint: {ckpt_dir}")
-
-            accum_loss = 0.0
-            micro_step = 0
+                accum_loss = 0.0
+                accum_c_rew = 0.0
+                accum_r_rew = 0.0
+                micro_step = 0
 
     if is_main:
         final_dir = output_dir / "final"
@@ -258,7 +267,8 @@ def main():
         torch.save(bf16_sd, final_dir / "pytorch_model.bin")
         torch.save(bf16_sd, final_dir / "model_bf16.pt")
         raw.cfg.to_json(str(final_dir / "model_config.json"))
-        logger.info(f"DPO complete. Model exported to {final_dir}")
+        logger.info(f"DPO complete. Final aligned model exported to {final_dir}")
+        upload_folder_async(str(final_dir), repo_id="Phase-Technologies/Densy-330M-Chat", path_in_repo="final")
 
     if world_size > 1:
         dist.destroy_process_group()
